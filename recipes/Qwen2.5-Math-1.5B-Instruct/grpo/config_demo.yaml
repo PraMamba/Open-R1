@@ -1,6 +1,6 @@
 # Model arguments
-model_type: &model_type "Qwen2.5-1.5B-Instruct"
-model_name_or_path: "/pri_exthome/Mamba/Model/Qwen/Qwen2.5-1.5B-Instruct"
+model_type: &model_type "Qwen2.5-Math-1.5B-Instruct"
+model_name_or_path: "/pri_exthome/Mamba/Model/Qwen/Qwen2.5-Math-1.5B-Instruct"
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
@@ -30,7 +30,7 @@ gradient_accumulation_steps: 1
 gradient_checkpointing: false
 gradient_checkpointing_kwargs:
   use_reentrant: false
-hub_model_id: Qwen2.5-1.5B-Instruct_Open-R1_GRPO
+hub_model_id: Qwen2.5-Math-1.5B-Instruct_Open-R1_GRPO
 hub_strategy: every_save
 log_level: info
 logging_steps: 2
@@ -38,14 +38,14 @@ logging_strategy: steps
 lr_scheduler_type: linear
 max_steps: -1
 num_train_epochs: 1
-output_dir: "/pri_exthome/Mamba/Project/Open-R1/Qwen2.5-1.5B-Instruct/GRPO"
+output_dir: "/pri_exthome/Mamba/Project/Open-R1/Qwen2.5-Math-1.5B-Instruct/GRPO"
 overwrite_output_dir: true
 per_device_eval_batch_size: 4   
 per_device_train_batch_size: 6
 push_to_hub: false
 report_to:
 - wandb
-run_name: Qwen2.5-1.5B-Instruct_Open-R1_GRPO
+run_name: Qwen2.5-Math-1.5B-Instruct_Open-R1_GRPO
 save_strategy: steps
 save_steps: 10
 save_total_limit: 10
