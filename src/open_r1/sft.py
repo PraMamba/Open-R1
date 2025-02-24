@@ -12,34 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Supervised fine-tuning script for decoder language models.
-
-Usage:
-
-# One 1 node of 8 x H100s
-accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r1/sft.py \
-    --model_name_or_path Qwen/Qwen2.5-1.5B-Instruct \
-    --dataset_name HuggingFaceH4/Bespoke-Stratos-17k \
-    --learning_rate 2.0e-5 \
-    --num_train_epochs 1 \
-    --packing \
-    --max_seq_length 4096 \
-    --per_device_train_batch_size 2 \
-    --gradient_accumulation_steps 8 \
-    --gradient_checkpointing \
-    --bf16 \
-    --logging_steps 5 \
-    --eval_strategy steps \
-    --eval_steps 100 \
-    --output_dir data/Qwen2.5-1.5B-Open-R1-Distill
-"""
-
 import logging
 import os
 import sys
 
 import datasets
+from dataclasses import dataclass, field
+
 import torch
 import transformers
 from datasets import load_dataset
@@ -58,8 +37,52 @@ from trl import (
     get_quantization_config,
 )
 
+logger = logging.getLogger(name=__name__)
 
-logger = logging.getLogger(__name__)
+@dataclass
+class SFTScriptArguments(ScriptArguments):
+    """
+    Script arguments for the SFT training script.
+
+    Args:
+        cache_dir (`str`):
+            Directory to cache datasets (optional).
+        validation_split (`float`):
+            Proportion of the dataset to use for validation (0.0 to 1.0).
+        max_train_samples (`int`):
+            Maximum number of training samples (optional).
+        max_eval_samples (`int`):
+            Maximum number of evaluation samples (optional).
+        resume (`str`):
+            Path to a checkpoint to resume training from (optional).
+    """
+    cache_dir: str = field(
+        default="/pri_exthome/Mamba/HuggingFace_Cache",
+        metadata={"help": "Directory to cache datasets (optional)"},
+    )
+    validation_split: float = field(
+        default=0.1,
+        metadata={"help": "Proportion of the dataset to use for validation (0.0 to 1.0)"},
+    )
+    max_train_samples: int = field(
+        default=None,
+        metadata={"help": "Maximum number of training samples (optional)"},
+    )
+    max_eval_samples: int = field(
+        default=None,
+        metadata={"help": "Maximum number of evaluation samples (optional)"},
+    )
+    resume: bool = field(
+        default=False,
+        metadata={"help": "Path to a checkpoint to resume training from (optional)"},
+    )
+
+SYSTEM_PROMPT = \
+    (
+        "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
+        "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
+        "process are enclosed within <think> </think> tags, respectively, i.e., <think> reasoning process here </think>"
+    )
 
 
 def main(script_args, training_args, model_args):
@@ -92,21 +115,62 @@ def main(script_args, training_args, model_args):
 
     # Check for last checkpoint
     last_checkpoint = None
-    if os.path.isdir(training_args.output_dir):
-        last_checkpoint = get_last_checkpoint(training_args.output_dir)
-    if last_checkpoint is not None and training_args.resume_from_checkpoint is None:
-        logger.info(f"Checkpoint detected, resuming training at {last_checkpoint=}.")
+    if script_args.resume:
+        if os.path.isdir(training_args.output_dir):
+            last_checkpoint = get_last_checkpoint(training_args.output_dir)
+        if last_checkpoint is not None and training_args.resume_from_checkpoint is None:
+            logger.info(f"Checkpoint detected, resuming training at {last_checkpoint=}.")
 
     ################
     # Load datasets
     ################
-    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config, cache_dir=script_args.cache_dir)
+    
+    # OpenR1-Math-220k
+    if "OpenR1-Math-220k" in script_args.dataset_name:
+        logger.info("*** Loading OpenR1-Math-220k ***")   
+        
+        # Format into conversation
+        def make_conversation(example):
+            return {
+                "prompt": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": example["problem"]},
+                ],
+                "completion": [{"role": "assistant", "content": example["generations"][0].strip()}]
+            }
+        dataset['default'] = dataset['default'].map(make_conversation) 
+          
+        if (script_args.validation_split is not None) and training_args.do_eval:
+            logger.info("*** Spliting Train and Eval ***") 
+            split_dataset = dataset['default'].train_test_split(test_size=script_args.validation_split, shuffle=False)
+            train_dataset = split_dataset[script_args.dataset_train_split]
+            eval_dataset = split_dataset[script_args.dataset_test_split]
+        else:
+            train_dataset = dataset['default']
+            eval_dataset = None
+
+    if training_args.do_train:
+        if train_dataset is None:
+            raise ValueError("--do_train requires a train dataset")
+        if script_args.max_train_samples is not None:
+            max_train_samples = min(len(train_dataset), script_args.max_train_samples)
+            logger.info(f"Max train samples set to: {max_train_samples}")
+            train_dataset = train_dataset.select(range(max_train_samples))
+
+    if training_args.do_eval:
+        if eval_dataset is None:
+            raise ValueError("--do_eval requires a valid dataset")
+        if script_args.max_eval_samples is not None:
+            max_eval_samples = min(len(eval_dataset), script_args.max_eval_samples)
+            logger.info(f"Max eval samples set to: {max_eval_samples}")
+            eval_dataset = eval_dataset.select(range(max_eval_samples))
 
     ################
     # Load tokenizer
     ################
     tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, use_fast=True
+        pretrained_model_name_or_path=model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, use_fast=True
     )
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -127,16 +191,18 @@ def main(script_args, training_args, model_args):
         device_map=get_kbit_device_map() if quantization_config is not None else None,
         quantization_config=quantization_config,
     )
-    training_args.model_init_kwargs = model_kwargs
+    # training_args.model_init_kwargs = model_kwargs
+    model = transformers.AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=model_args.model_name_or_path, **model_kwargs)
+    model.config.max_position_embeddings = 131072
 
     ############################
     # Initialize the SFT Trainer
     ############################
     trainer = SFTTrainer(
-        model=model_args.model_name_or_path,
+        model=model,
         args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset if training_args.eval_strategy != "no" else None,
         processing_class=tokenizer,
         peft_config=get_peft_config(model_args),
         callbacks=get_callbacks(training_args, model_args),
@@ -153,7 +219,7 @@ def main(script_args, training_args, model_args):
         checkpoint = last_checkpoint
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
     metrics = train_result.metrics
-    metrics["train_samples"] = len(dataset[script_args.dataset_train_split])
+    metrics["train_samples"] = len(train_dataset)
     trainer.log_metrics("train", metrics)
     trainer.save_metrics("train", metrics)
     trainer.save_state()
@@ -182,7 +248,7 @@ def main(script_args, training_args, model_args):
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
         metrics = trainer.evaluate()
-        metrics["eval_samples"] = len(dataset[script_args.dataset_test_split])
+        metrics["eval_samples"] = len(eval_dataset)
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 
@@ -195,6 +261,6 @@ def main(script_args, training_args, model_args):
 
 
 if __name__ == "__main__":
-    parser = TrlParser((ScriptArguments, SFTConfig, ModelConfig))
+    parser = TrlParser((SFTScriptArguments, SFTConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
     main(script_args, training_args, model_args)
