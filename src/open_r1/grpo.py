@@ -25,14 +25,17 @@ from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
 from open_r1.configs import GRPOConfig
-from open_r1.rewards import accuracy_reward, format_reward, get_cosine_scaled_reward, reasoning_steps_reward
+from open_r1.rewards import *
 from open_r1.utils.callbacks import get_callbacks
+# from open_r1.replace_grpo_trainer_1 import trigger
+
 from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
+from liger_kernel.transformers import apply_liger_kernel_to_qwen2
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(name=__name__)
 
-
+# ["accuracy", "format", "reasoning_steps", "cosine", "xmlcount", "soft_format", "strict_format", "int", "correctness"]
 @dataclass
 class GRPOScriptArguments(ScriptArguments):
     """
@@ -51,10 +54,19 @@ class GRPOScriptArguments(ScriptArguments):
             Maximum reward for cosine scaling for correct answers.
         cosine_max_len (`int`):
             Maximum length for cosine scaling.
+        cache_dir (`str`):
+            Directory to cache datasets (optional).
+        validation_split (`float`):
+            Proportion of the dataset to use for validation (0.0 to 1.0).
+        max_train_samples (`int`):
+            Maximum number of training samples (optional).
+        max_eval_samples (`int`):
+            Maximum number of evaluation samples (optional).
+        resume (`str`):
+            Path to a checkpoint to resume training from (optional).
     """
-
     reward_funcs: list[str] = field(
-        default_factory=lambda: ["accuracy", "format", "reasoning_steps", "cosine"],
+        default_factory=lambda: ["xmlcount", "soft_format", "strict_format", "int", "correctness"],
         metadata={
             "help": "List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine'"
         },
@@ -79,15 +91,45 @@ class GRPOScriptArguments(ScriptArguments):
         default=1000,
         metadata={"help": "Maximum length for scaling"},
     )
+    cache_dir: str = field(
+        default="/pri_exthome/Mamba/HuggingFace_Cache",
+        metadata={"help": "Directory to cache datasets (optional)"},
+    )
+    validation_split: float = field(
+        default=0.1,
+        metadata={"help": "Proportion of the dataset to use for validation (0.0 to 1.0)"},
+    )
+    max_train_samples: int = field(
+        default=None,
+        metadata={"help": "Maximum number of training samples (optional)"},
+    )
+    max_eval_samples: int = field(
+        default=None,
+        metadata={"help": "Maximum number of evaluation samples (optional)"},
+    )
+    resume: bool = field(
+        default=False,
+        metadata={"help": "Path to a checkpoint to resume training from (optional)"},
+    )
 
 
-SYSTEM_PROMPT = (
-    "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
-    "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
-    "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
-    "<think> reasoning process here </think><answer> answer here </answer>"
-)
+SYSTEM_PROMPT = \
+    (
+        "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
+        "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
+        "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
+        "<think> reasoning process here </think><answer> answer here </answer>"
+    )
 
+XML_COT_FORMAT = \
+    """
+        <reasoning>
+        {reasoning}
+        </reasoning>
+        <answer>
+        {answer}
+        </answer>
+    """
 
 def main(script_args, training_args, model_args):
     # Set seed for reproducibility
@@ -102,7 +144,7 @@ def main(script_args, training_args, model_args):
         handlers=[logging.StreamHandler(sys.stdout)],
     )
     log_level = training_args.get_process_log_level()
-    logger.setLevel(log_level)
+    logger.setLevel(level=log_level)
     datasets.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.enable_default_handler()
@@ -119,27 +161,34 @@ def main(script_args, training_args, model_args):
 
     # Check for last checkpoint
     last_checkpoint = None
-    if os.path.isdir(training_args.output_dir):
-        last_checkpoint = get_last_checkpoint(training_args.output_dir)
-    if last_checkpoint is not None and training_args.resume_from_checkpoint is None:
-        logger.info(f"Checkpoint detected, resuming training at {last_checkpoint=}.")
+    if script_args.resume:
+        if os.path.isdir(training_args.output_dir):
+            last_checkpoint = get_last_checkpoint(training_args.output_dir)
+        if last_checkpoint is not None and training_args.resume_from_checkpoint is None:
+            logger.info(f"Checkpoint detected, resuming training at {last_checkpoint=}.")
 
     # Load the dataset
-    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    dataset = load_dataset(path=script_args.dataset_name, name=script_args.dataset_config, cache_dir=script_args.cache_dir)
 
     # Get reward functions
-    REWARD_FUNCS_REGISTRY = {
-        "accuracy": accuracy_reward,
-        "format": format_reward,
-        "reasoning_steps": reasoning_steps_reward,
-        "cosine": get_cosine_scaled_reward(
-            min_value_wrong=script_args.cosine_min_value_wrong,
-            max_value_wrong=script_args.cosine_max_value_wrong,
-            min_value_correct=script_args.cosine_min_value_correct,
-            max_value_correct=script_args.cosine_max_value_correct,
-            max_len=script_args.cosine_max_len,
-        ),
-    }
+    REWARD_FUNCS_REGISTRY = \
+        {
+            "accuracy": accuracy_reward,
+            "format": format_reward,
+            "reasoning_steps": reasoning_steps_reward,
+            "cosine": get_cosine_scaled_reward(
+                min_value_wrong=script_args.cosine_min_value_wrong,
+                max_value_wrong=script_args.cosine_max_value_wrong,
+                min_value_correct=script_args.cosine_min_value_correct,
+                max_value_correct=script_args.cosine_max_value_correct,
+                max_len=script_args.cosine_max_len,
+            ),
+            "xmlcount": xmlcount_reward_func,
+            "soft_format": soft_format_reward_func,
+            "strict_format": strict_format_reward_func,
+            "int": int_reward_func,
+            "correctness": correctness_reward_func
+        }
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
     # Format into conversation
@@ -149,12 +198,40 @@ def main(script_args, training_args, model_args):
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": example["problem"]},
             ],
+            "answer": XML_COT_FORMAT.format(reasoning=example["solution"].strip(), answer=example["answer"].strip())
         }
 
     dataset = dataset.map(make_conversation)
-    for split in dataset:
-        if "messages" in dataset[split].column_names:
-            dataset[split] = dataset[split].remove_columns("messages")
+    # for split in dataset:
+    #     if "messages" in dataset[split].column_names:
+    #         dataset[split] = dataset[split].remove_columns("messages")
+            
+            
+    # split train and validation 
+    train_dataset = dataset
+    eval_dataset = None        
+    
+    # OpenR1-Math-220k
+    if "OpenR1-Math-220k" in script_args.dataset_name:
+        logger.info("*** Loading OpenR1-Math-220k ***")     
+        if script_args.validation_split is not None:
+            split_dataset = dataset['default'].train_test_split(test_size=script_args.validation_split, shuffle=False)
+            train_dataset = split_dataset[script_args.dataset_train_split]
+            eval_dataset = split_dataset[script_args.dataset_test_split]
+
+    if training_args.do_train:
+        if train_dataset is None:
+            raise ValueError("--do_train requires a train dataset")
+        if script_args.max_train_samples is not None:
+            max_train_samples = min(len(train_dataset), script_args.max_train_samples)
+            train_dataset = train_dataset.select(range(max_train_samples))
+
+    if training_args.do_eval:
+        if eval_dataset is None:
+            raise ValueError("--do_eval requires a valid dataset")
+        if script_args.max_eval_samples is not None:
+            max_eval_samples = min(len(eval_dataset), script_args.max_eval_samples)
+            eval_dataset = eval_dataset.select(range(max_eval_samples))
 
     logger.info("*** Initializing model kwargs ***")
     torch_dtype = (
@@ -167,19 +244,28 @@ def main(script_args, training_args, model_args):
         torch_dtype=torch_dtype,
         use_cache=False if training_args.gradient_checkpointing else True,
     )
-    training_args.model_init_kwargs = model_kwargs
+    
+    apply_liger_kernel_to_qwen2(
+        rope=True,
+        cross_entropy=False,
+        fused_linear_cross_entropy=True,
+        rms_norm=True,
+        swiglu=True,
+        model=None,
+    )
+    model = transformers.AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=model_args.model_name_or_path, **model_kwargs)
 
     #############################
     # Initialize the GRPO trainer
     #############################
     trainer = GRPOTrainer(
-        model=model_args.model_name_or_path,
+        model=model,
         reward_funcs=reward_funcs,
         args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        peft_config=get_peft_config(model_args),
-        callbacks=get_callbacks(training_args, model_args),
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset if training_args.eval_strategy != "no" else None,
+        peft_config=get_peft_config(model_args=model_args),
+        callbacks=get_callbacks(train_config=training_args, model_config=model_args),
     )
 
     ###############
@@ -193,7 +279,7 @@ def main(script_args, training_args, model_args):
         checkpoint = last_checkpoint
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
     metrics = train_result.metrics
-    metrics["train_samples"] = len(dataset[script_args.dataset_train_split])
+    metrics["train_samples"] = len(train_dataset)
     trainer.log_metrics("train", metrics)
     trainer.save_metrics("train", metrics)
     trainer.save_state()
@@ -219,10 +305,10 @@ def main(script_args, training_args, model_args):
     ##########
     # Evaluate
     ##########
-    if training_args.do_eval:
+    if training_args.do_eval and eval_dataset is not None:
         logger.info("*** Evaluate ***")
         metrics = trainer.evaluate()
-        metrics["eval_samples"] = len(dataset[script_args.dataset_test_split])
+        metrics["eval_samples"] = len(eval_dataset)
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 
