@@ -1,13 +1,22 @@
 """Reward functions for GRPO training."""
 
+import json
 import math
 import re
+from typing import Dict
 
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 
-import logging
-logger = logging.getLogger(__name__)
+from .utils import is_e2b_available
+
+
+if is_e2b_available():
+    from dotenv import load_dotenv
+    from e2b_code_interpreter import Sandbox
+
+    load_dotenv()
+
 
 def accuracy_reward(completions, solution, **kwargs):
     """Reward function that checks if the completion is the same as the ground truth."""
@@ -54,7 +63,7 @@ def accuracy_reward(completions, solution, **kwargs):
 
 
 def format_reward(completions, **kwargs):
-    """Reward function that checks if the completion has a specific format."""
+    """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
     pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
     completion_contents = [completion[0]["content"] for completion in completions]
     matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
@@ -62,7 +71,7 @@ def format_reward(completions, **kwargs):
 
 
 def reasoning_steps_reward(completions, **kwargs):
-    """Reward function that checks for clear step-by-step reasoning.
+    r"""Reward function that checks for clear step-by-step reasoning.
     Regex pattern:
         Step \d+: - matches "Step 1:", "Step 2:", etc.
         ^\d+\. - matches numbered lists like "1.", "2.", etc. at start of line
@@ -76,6 +85,79 @@ def reasoning_steps_reward(completions, **kwargs):
 
     # Magic nubmer 3 to encourage 3 steps and more, otherwise partial reward
     return [min(1.0, count / 3) for count in matches]
+
+
+def len_reward(completions: list[Dict[str, str]], solution: list[str], **kwargs) -> float:
+    """Compute length-based rewards to discourage overthinking and promote token efficiency.
+
+    Taken from from the Kimi 1.5 tech report: https://arxiv.org/abs/2501.12599
+
+    Args:
+        completions: List of model completions
+        solution: List of ground truth solutions
+
+    Returns:
+        List of rewards where:
+        - For correct answers: reward = 0.5 - (len - min_len)/(max_len - min_len)
+        - For incorrect answers: reward = min(0, 0.5 - (len - min_len)/(max_len - min_len))
+    """
+    contents = [completion[0]["content"] for completion in completions]
+
+    # First check correctness of answers
+    correctness = []
+    for content, sol in zip(contents, solution):
+        gold_parsed = parse(
+            sol,
+            extraction_mode="first_match",
+            extraction_config=[LatexExtractionConfig()],
+        )
+        if len(gold_parsed) == 0:
+            # Skip unparseable examples
+            correctness.append(True)  # Treat as correct to avoid penalizing
+            print("Failed to parse gold solution: ", sol)
+            continue
+
+        answer_parsed = parse(
+            content,
+            extraction_config=[
+                LatexExtractionConfig(
+                    normalization_config=NormalizationConfig(
+                        nits=False,
+                        malformed_operators=False,
+                        basic_latex=True,
+                        equations=True,
+                        boxed=True,
+                        units=True,
+                    ),
+                    boxed_match_priority=0,
+                    try_extract_without_anchor=False,
+                )
+            ],
+            extraction_mode="first_match",
+        )
+        correctness.append(verify(answer_parsed, gold_parsed))
+
+    # Calculate lengths
+    lengths = [len(content) for content in contents]
+    min_len = min(lengths)
+    max_len = max(lengths)
+
+    # If all responses have the same length, return zero rewards
+    if max_len == min_len:
+        return [0.0] * len(completions)
+
+    rewards = []
+    for length, is_correct in zip(lengths, correctness):
+        lambda_val = 0.5 - (length - min_len) / (max_len - min_len)
+
+        if is_correct:
+            reward = lambda_val
+        else:
+            reward = min(0, lambda_val)
+
+        rewards.append(float(reward))
+
+    return rewards
 
 
 def get_cosine_scaled_reward(
@@ -156,133 +238,143 @@ def get_cosine_scaled_reward(
     return cosine_scaled_reward
 
 
-def extract_xml_answer(text: str) -> str:
+def get_repetition_penalty_reward(ngram_size: int, max_penalty: float):
     """
-    Extracts the <answer>...</answer> from the text, ignoring any <reasoning> blocks.
-    """
-    if "<answer>" not in text or "</answer>" not in text:
-        return ""
-    answer_part = text.split("<answer>")[-1]
-    answer_part = answer_part.split("</answer>")[0]
-    return answer_part.strip()
-
-def correctness_reward_func(prompts, completions, answer, **kwargs) -> list[float]:
-    """
-    Checks if the extracted final answer matches the reference exactly.
-    Returns 2.0 if correct, else 0.0.
+    Computes N-gram repetition penalty as described in Appendix C.2 of https://arxiv.org/abs/2502.03373.
+    Reference implementation from: https://github.com/eddycmu/demystify-long-cot/blob/release/openrlhf/openrlhf/reward/repetition.py
 
     Args:
-      prompts:     List of prompt strings (one prompt per sample).
-      completions: List of model outputs (one string per sample).
-      answer:      List of reference answers (one string per sample).
+    ngram_size: size of the n-grams
+    max_penalty: Maximum (negative) penalty for wrong answers
     """
-    # Because we pass one sample at a time, we have equal lengths
-    # Or if batched, we can still zip them up
-    # Example: prompts[i] is a string, completions[i] is a string, answer[i] is a string.
+    if max_penalty > 0:
+        raise ValueError(f"max_penalty {max_penalty} should not be positive")
+
+    def zipngram(text: str, ngram_size: int):
+        words = text.lower().split()
+        return zip(*[words[i:] for i in range(ngram_size)])
+
+    def repetition_penalty_reward(completions, **kwargs) -> float:
+        """
+        reward function the penalizes repetitions
+        ref implementation: https://github.com/eddycmu/demystify-long-cot/blob/release/openrlhf/openrlhf/reward/repetition.py
+
+        Args:
+            completions: List of model completions
+        """
+
+        contents = [completion[0]["content"] for completion in completions]
+        rewards = []
+        for completion in contents:
+            if completion == "":
+                rewards.append(0.0)
+                continue
+            if len(completion.split()) < ngram_size:
+                rewards.append(0.0)
+                continue
+
+            ngrams = set()
+            total = 0
+            for ng in zipngram(completion, ngram_size):
+                ngrams.add(ng)
+                total += 1
+
+            scaling = 1 - len(ngrams) / total
+            reward = scaling * max_penalty
+            rewards.append(reward)
+        return rewards
+
+    return repetition_penalty_reward
+
+
+def extract_code(completion: str) -> str:
+    pattern = re.compile(r"```python\n(.*?)```", re.DOTALL)
+    matches = pattern.findall(completion)
+    extracted_answer = matches[-1] if len(matches) >= 1 else ""
+    return extracted_answer
+
+
+def code_reward(completions, **kwargs) -> list[float]:
+    """Reward function that evaluates code snippets using the E2B code interpreter.
+
+    Assumes the dataset contains a `verification_info` column with test cases.
+    """
+    if not is_e2b_available():
+        raise ImportError(
+            "E2B is not available and required for this reward function. Please install E2B with "
+            "`pip install e2b-code-interpreter` and add an API key to a `.env` file."
+        )
 
     rewards = []
-    for p, c, a in zip(prompts, completions, answer):
-        extracted = extract_xml_answer(c)
-        # debug print
-        print('-'*20,
-              f"\nPrompt:\n{p}",
-              f"\nRefAnswer:\n{a}",
-              f"\nModelOutput:\n{c}",
-              f"\nExtracted:\n{extracted}")
-        if extracted == a:
-            rewards.append(2.0)
-        else:
-            rewards.append(0.0)
+    # TODO: add support for other languages in E2B: https://e2b.dev/docs/code-interpreting/supported-languages
+    try:
+        """Returns a reward function that evaluates code snippets in a sandbox."""
+        evaluation_script_template = """
+        import subprocess
+        import json
 
+        def evaluate_code(code, test_cases):
+            passed = 0
+            total = len(test_cases)
+            exec_timeout = 5
+
+            for case in test_cases:
+                process = subprocess.run(
+                    ["python3", "-c", code],
+                    input=case["input"],
+                    text=True,
+                    capture_output=True,
+                    timeout=exec_timeout
+                )
+
+                if process.returncode != 0:  # Error in execution
+                    continue
+
+                output = process.stdout.strip()
+                if output.strip() == case["output"].strip():
+                    passed += 1
+
+            success_rate = (passed / total)
+            return success_rate
+
+        code_snippet = {code}
+        test_cases = json.loads({test_cases})
+
+        evaluate_code(code_snippet, test_cases)
+        """
+        code_snippets = [extract_code(completion[-1]["content"]) for completion in completions]
+        verification_info = kwargs["verification_info"]
+        scripts = [
+            evaluation_script_template.format(
+                code=json.dumps(code), test_cases=json.dumps(json.dumps(info["test_cases"]))
+            )
+            for code, info in zip(code_snippets, verification_info)
+        ]
+        with Sandbox(timeout=30, request_timeout=3) as sbx:
+            for script in scripts:
+                execution = sbx.run_code(script, language=verification_info["language"])
+                try:
+                    output = float(execution.text)
+                except (TypeError, ValueError):
+                    output = 0.0
+                rewards.append(output)
+    except Exception as e:
+        print(f"Error from E2B executor: {e}")
+        rewards = [0.0] * len(completions)
     return rewards
 
-def int_reward_func(completions, **kwargs) -> list[float]:
-    """
-    Simple numeric check: if the extracted <answer> is purely digit-based,
-    return 0.5, else 0.0.
-    """
-    rewards = []
-    for c in completions:
-        extracted = extract_xml_answer(c)
-        rewards.append(0.5 if extracted.isdigit() else 0.0)
-    return rewards
 
-def strict_format_reward_func(completions, **kwargs) -> list[float]:
-    """
-    Checks if the entire completion matches a strict pattern:
-    <reasoning>\n...\n</reasoning>\n<answer>\n...\n</answer>\n
-    """
-    pattern = r"^<reasoning>\n.*?\n</reasoning>\n<answer>\n.*?\n</answer>\n?$"
-    # Using ? for optional final newline
-    # Also consider re.DOTALL so that '.' matches newlines
-    compiled_pattern = re.compile(pattern, flags=re.DOTALL)
+def get_code_format_reward(language: str = "python"):
+    """Format reward function specifically for code responses.
 
-    rewards = []
-    for c in completions:
-        # 确保 c 是字符串类型
-        if isinstance(c, list):
-            c = ' '.join(map(str, c))  # 如果是列表，将其转换为字符串
-        elif not isinstance(c, str):
-            rewards.append(0.0)
-            continue
-        
-        if compiled_pattern.match(c):
-            rewards.append(0.5)
-        else:
-            rewards.append(0.0)
-    return rewards
-
-def soft_format_reward_func(completions, **kwargs) -> list[float]:
+    Args:
+        language: Programming language supported by E2B https://e2b.dev/docs/code-interpreting/supported-languages
     """
-    More lenient pattern check: must contain <reasoning>...</reasoning> then <answer>...</answer>.
-    """
-    pattern = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
-    compiled_pattern = re.compile(pattern, flags=re.DOTALL)
+    pattern = rf"^<think>.*?</think>\s*<answer>.*?```{language}\n.*?```.*?</answer>$"
 
-    rewards = []
-    for c in completions:
-        # 确保 c 是字符串类型
-        if isinstance(c, list):
-            c = ' '.join(map(str, c))  # 如果是列表，将其转换为字符串
-        elif not isinstance(c, str):
-            rewards.append(0.0)
-            continue
-        
-        if compiled_pattern.search(c):
-            rewards.append(0.5)
-        else:
-            rewards.append(0.0)
-    return rewards
+    def code_format_reward(completions, **kwargs):
+        completion_contents = [completion[0]["content"] for completion in completions]
+        matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
+        return [1.0 if match else 0.0 for match in matches]
 
-def count_xml(text: str) -> float:
-    """
-    Score based on presence/structure of <reasoning> and <answer> tags,
-    with a small penalty for trailing text.
-    """
-    score = 0.0
-
-    # Basic presence checks:
-    if "<reasoning>\n" in text:
-        score += 0.125
-    if "\n</reasoning>\n" in text:
-        score += 0.125
-    if "\n<answer>\n" in text:
-        score += 0.125
-        # penalize extra text after </answer>\n
-        # split on the final close tag
-        if "\n</answer>\n" in text:
-            after = text.split("\n</answer>\n")[-1]
-            score -= len(after) * 0.001
-    if "\n</answer>" in text:
-        score += 0.125
-        # again penalize trailing text after close
-        after = text.split("\n</answer>")[-1]
-        score -= (len(after) - 1) * 0.001
-
-    return score
-
-def xmlcount_reward_func(completions, **kwargs) -> list[float]:
-    """
-    Applies count_xml to each completion string.
-    """
-    return [count_xml(c) for c in completions]
+    return code_format_reward
